@@ -49,10 +49,11 @@ $$
 
 ## 3. Data Pipeline, Discretization & Canary Injection
 
-1. **Synthetic GPS Generator:** Generates continuous latitude/longitude coordinate walks over time for 10 simulated users (Clients 0–9) across an urban spatial domain.
-2. **H3 Discretization:** Converts continuous coordinates into discrete spatial Hexagons using Uber's **H3 library** at **Resolution 9** (~174 m edge length, ~0.1 km$^2$ cell area).
-3. **Partitioning:** Groups coordinates by user and orders them chronologically to form sequential trajectories. Clients 0–8 contain only standard background trajectories.
-4. **Canary Injection:** A highly unique, synthetic 10-Hexagon commute trajectory is injected 50 times exclusively into Client 9:
+1. **Microsoft GeoLife GPS Trajectories:** Parses raw `.plt` files from `./data/Geolife Trajectories 1.3/Data/`, skipping the 6 header lines and extracting `Latitude`, `Longitude`, and chronological Pandas datetimes.
+2. **Top-10 Client Mapping:** Selects the top 10 users with the most GPS trajectory points (User IDs: `153`, `128`, `041`, `017`, `163`, `068`, `010`, `025`, `167`, `030`) and maps them to `client_0` through `client_9`.
+3. **Trip Chunking & Static Filtering:** Splits user trajectories into distinct trips whenever consecutive timestamps exceed a 6-hour gap (`pd.Timedelta(hours=6)`). Collapses consecutive identical H3 Hexagon IDs to learn movement transitions.
+4. **H3 Discretization & Shared Caching:** Converts coordinates to H3 Resolution 9 discrete Hexagon IDs with high-speed caching in `geolife_h3_cache.pkl` shared across `fedavg` and `OPA`.
+5. **Canary Injection:** A highly unique, synthetic 10-Hexagon commute trajectory is injected 50 times exclusively into Client 9:
    ```text
    89283090ca7ffff 89283090cafffff 89283090c23ffff 89283090893ffff 8928309089bffff 8928309088bffff 892830908c7ffff 8928309081bffff 89283090857ffff 89283090847ffff
    ```

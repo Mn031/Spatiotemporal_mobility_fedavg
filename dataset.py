@@ -1,20 +1,38 @@
 """
-dataset.py - Synthetic GPS Mobility Data Pipeline, H3 Discretization, and Canary Injection.
+dataset.py - Real Microsoft GeoLife GPS Trajectory Pipeline, H3 Discretization, and Canary Injection.
 
 Features:
-  1. Synthetic GPS Generator: Generates continuous Lat/Lon coordinate walks over time for 10 users (Clients 0-9).
-  2. H3 Discretization: Uses the h3 library (resolution 9) to convert continuous Lat/Lon coordinates
-     into discrete Hexagon IDs. These Hex IDs serve as our "words".
-  3. Trajectory Assembly: Groups data by User_ID and orders by time into sequential trajectories ("sentences").
-  4. Canary Injection: Injects a unique 10-Hex-ID synthetic commute trajectory 50 times exclusively into Client 9.
-     Clients 0-8 never observe this sequence.
-  5. LocationTokenizer: Lightweight vocabulary mapping H3 Hexagon IDs to discrete integer tokens (<PAD>=0, <UNK>=1).
-  6. Sliding Window DataLoader: Sequence length = 5 for PyTorch NextLocationModel compatibility.
+  1. GeoLife .plt Parser:
+     - Parses real GPS trajectory files from the Microsoft GeoLife Trajectories 1.3 dataset.
+     - Skips the first 6 header lines.
+     - Extracts Latitude, Longitude, and combines Date/Time into chronological Pandas datetime objects.
+  2. Client Mapping (10 Clients):
+     - Ranks and filters the dataset to use the top 10 users with the most trajectory points:
+       User IDs: ['153', '128', '041', '017', '163', '068', '010', '025', '167', '030'].
+     - Maps these 10 users directly to client_0 through client_9.
+  3. H3 Discretization & Shared Caching:
+     - Converts continuous Lat/Lon coordinates into discrete H3 Hexagon IDs (Resolution 9).
+     - Implements high-speed caching (geolife_h3_cache.pkl) shared across fedavg and OPA.
+  4. Advanced Trajectory Processing (Trip Chunking & Static Filtering):
+     - Trip Splitting: Splits user points into distinct trips whenever consecutive timestamps
+       exceed a 6-hour gap (pd.Timedelta(hours=6)).
+     - Static Point Filtering: Collapses consecutive identical H3 Hexagon IDs to learn movement
+       transitions rather than stationary dwell times.
+  5. Canary Injection:
+     - Injects a unique 10-Hex-ID synthetic commute trajectory 50 times exclusively into Client 9.
+     - Clients 0-8 never observe this canary commute.
+  6. DataLoader Integration:
+     - Constructs PyTorch sliding window datasets (sequence_length=5) with prefix padding
+       for causal NextLocationModel training and greedy rollout evaluation.
 """
 
 import collections
+import os
+import pickle
+import sys
 from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 import h3
@@ -39,6 +57,20 @@ CANARY_HEX_SEQUENCE: List[str] = [
 CANARY_STRING: str = " ".join(CANARY_HEX_SEQUENCE)
 CANARY_START_HEX: str = CANARY_HEX_SEQUENCE[0]
 
+# Top 10 GeoLife users with the most GPS trajectory points (sorted descending)
+GEOLIFE_TOP_10_USERS: List[str] = [
+    "153",  # Client 0: 2,156,994 points (1,884 trips)
+    "128",  # Client 1: 1,208,500 points (1,324 trips)
+    "041",  # Client 2: 1,057,043 points (159 trips)
+    "017",  # Client 3: 1,026,179 points (198 trips)
+    "163",  # Client 4:   969,100 points (763 trips)
+    "068",  # Client 5:   937,876 points (382 trips)
+    "010",  # Client 6:   935,576 points (129 trips)
+    "025",  # Client 7:   629,896 points (212 trips)
+    "167",  # Client 8:   618,649 points (355 trips)
+    "030",  # Client 9:   615,948 points (234 trips)
+]
+
 
 def lat_lng_to_h3(lat: float, lng: float, resolution: int = 9) -> str:
     """
@@ -50,6 +82,235 @@ def lat_lng_to_h3(lat: float, lng: float, resolution: int = 9) -> str:
     elif hasattr(h3, "geo_to_h3"):
         return h3.geo_to_h3(lat, lng, resolution)
     raise AttributeError("H3 library does not expose latlng_to_cell or geo_to_h3.")
+
+
+# ---------------------------------------------------------------------
+# PATH RESOLUTION & CACHING HELPERS
+# ---------------------------------------------------------------------
+def resolve_geolife_data_dir(data_dir: Optional[str] = None) -> str:
+    """Resolves the absolute path to the GeoLife 'Data' directory across environments."""
+    if data_dir and os.path.exists(data_dir):
+        return os.path.abspath(data_dir)
+
+    module_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(".", "data", "Geolife Trajectories 1.3", "Data"),
+        os.path.join(".", "Spatiotemporal_moblity", "data", "Geolife Trajectories 1.3", "Data"),
+        os.path.join(module_dir, "..", "data", "Geolife Trajectories 1.3", "Data"),
+        os.path.join(module_dir, "..", "..", "data", "Geolife Trajectories 1.3", "Data"),
+        os.path.join(module_dir, "data", "Geolife Trajectories 1.3", "Data"),
+        r"D:\MTP\Spatiotemporal_moblity\data\Geolife Trajectories 1.3\Data",
+        r"D:\MTP\data\Geolife Trajectories 1.3\Data",
+    ]
+    for c in candidates:
+        abs_c = os.path.abspath(c)
+        if os.path.exists(abs_c):
+            return abs_c
+
+    raise FileNotFoundError(
+        "Could not locate the GeoLife dataset directory. Checked candidates: "
+        + ", ".join(candidates)
+    )
+
+
+def resolve_cache_file(cache_path: Optional[str] = None, data_dir: Optional[str] = None) -> str:
+    """Resolves the shared geolife_h3_cache.pkl file path for both fedavg and OPA."""
+    if cache_path:
+        return os.path.abspath(cache_path)
+
+    cache_name = "geolife_h3_cache.pkl"
+    module_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # Check known candidate locations for an existing cache file
+    candidates = [
+        os.path.join(module_dir, "..", "data", cache_name),
+        os.path.join(module_dir, "..", cache_name),
+        os.path.join(".", "data", cache_name),
+        os.path.join(".", "Spatiotemporal_moblity", "data", cache_name),
+        os.path.join(".", cache_name),
+        os.path.join(r"D:\MTP\Spatiotemporal_moblity\data", cache_name),
+        os.path.join(r"D:\MTP\data", cache_name),
+    ]
+    for c in candidates:
+        abs_c = os.path.abspath(c)
+        if os.path.exists(abs_c):
+            return abs_c
+
+    # Default save target: shared data/ directory
+    try:
+        resolved_data = resolve_geolife_data_dir(data_dir)
+        shared_data_dir = os.path.dirname(os.path.dirname(resolved_data))
+        return os.path.abspath(os.path.join(shared_data_dir, cache_name))
+    except Exception:
+        return os.path.abspath(os.path.join(".", "data", cache_name))
+
+
+# ---------------------------------------------------------------------
+# GEOLIFE .PLT PARSER & TRIP PROCESSING
+# ---------------------------------------------------------------------
+def parse_geolife_plt_file(file_path: str) -> List[Tuple[float, float, str]]:
+    """
+    Parses a single GeoLife .plt file.
+    - Skips the first 6 header lines.
+    - Extracts Latitude (col 0), Longitude (col 1), and Date + Time (cols 5, 6).
+    """
+    records: List[Tuple[float, float, str]] = []
+    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+        # Skip 6 header lines
+        for _ in range(6):
+            if not f.readline():
+                return []
+        for line in f:
+            line_str = line.strip()
+            if not line_str:
+                continue
+            parts = line_str.split(",")
+            if len(parts) >= 7:
+                try:
+                    lat = float(parts[0])
+                    lon = float(parts[1])
+                    dt_str = f"{parts[5]} {parts[6]}"
+                    records.append((lat, lon, dt_str))
+                except (ValueError, IndexError):
+                    continue
+    return records
+
+
+def get_top_10_geolife_users(data_dir: str) -> List[str]:
+    """Returns the top 10 GeoLife users with the most trajectory points."""
+    return list(GEOLIFE_TOP_10_USERS)
+
+
+def process_user_trajectories(
+    user_id: str,
+    data_dir: str,
+    resolution: int = 9,
+    time_gap_hours: float = 6.0,
+    min_trip_transitions: int = 4,
+    max_files: Optional[int] = None,
+) -> List[List[str]]:
+    """
+    Reads all .plt files for a GeoLife user, sorts points chronologically,
+    splits into distinct trips on > 6-hour gaps, discretizes into H3 Hexagons,
+    and collapses consecutive identical Hexagon IDs (static point filtering).
+    """
+    traj_dir = os.path.join(data_dir, user_id, "Trajectory")
+    if not os.path.exists(traj_dir):
+        return []
+
+    plt_files = sorted([os.path.join(traj_dir, f) for f in os.listdir(traj_dir) if f.endswith(".plt")])
+    if max_files is not None and max_files > 0:
+        plt_files = plt_files[:max_files]
+
+    all_points: List[Tuple[float, float, str]] = []
+    for fpath in plt_files:
+        pts = parse_geolife_plt_file(fpath)
+        all_points.extend(pts)
+
+    if not all_points:
+        return []
+
+    # Assemble chronological Pandas DataFrame
+    df = pd.DataFrame(all_points, columns=["lat", "lon", "datetime_str"])
+    df["datetime"] = pd.to_datetime(df["datetime_str"])
+    df.sort_values("datetime", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+
+    # Trip Splitting: identify time gaps > 6 hours
+    time_diffs = df["datetime"].diff()
+    split_indices = df.index[time_diffs > pd.Timedelta(hours=time_gap_hours)].tolist()
+
+    trips: List[List[str]] = []
+    start_idx = 0
+    for s_idx in split_indices + [len(df)]:
+        chunk_df = df.iloc[start_idx:s_idx]
+        start_idx = s_idx
+
+        # Static Point Filtering: Collapse consecutive identical H3 Hexagon IDs
+        hex_seq: List[str] = []
+        for lat, lon in zip(chunk_df["lat"], chunk_df["lon"]):
+            cell = lat_lng_to_h3(lat, lon, resolution=resolution)
+            if not hex_seq or hex_seq[-1] != cell:
+                hex_seq.append(cell)
+
+        # Retain trips with at least min_trip_transitions movement steps
+        if len(hex_seq) >= min_trip_transitions:
+            trips.append(hex_seq)
+
+    return trips
+
+
+def load_geolife_trajectories(
+    data_dir: Optional[str] = None,
+    cache_path: Optional[str] = None,
+    resolution: int = 9,
+    time_gap_hours: float = 6.0,
+    min_trip_transitions: int = 4,
+    max_files_per_user: Optional[int] = None,
+    force_reparse: bool = False,
+) -> Dict[int, List[List[str]]]:
+    """
+    Loads discretized H3 trajectories for the top 10 GeoLife users.
+    Checks for a pre-computed cache (geolife_h3_cache.pkl). If present, loads immediately.
+    Otherwise, parses .plt files, executes H3 discretization, and writes the cache.
+    
+    Returns:
+        Dict mapping client index (0 to 9) -> list of trips (each trip is a List[str] of Hex IDs).
+    """
+    resolved_cache = resolve_cache_file(cache_path, data_dir)
+
+    # Check cache existence
+    if not force_reparse and os.path.exists(resolved_cache):
+        try:
+            with open(resolved_cache, "rb") as f:
+                cached_data = pickle.load(f)
+            if isinstance(cached_data, dict) and "client_trajectories" in cached_data:
+                print(f"[CACHE] Loaded GeoLife H3 trajectories directly from cache: {resolved_cache}")
+                return cached_data["client_trajectories"]
+            elif isinstance(cached_data, dict):
+                return cached_data
+        except Exception as e:
+            print(f"[CACHE WARNING] Could not load cache from {resolved_cache} ({e}). Reparsing...")
+
+    # Parse GeoLife from source
+    resolved_data = resolve_geolife_data_dir(data_dir)
+    top_users = get_top_10_geolife_users(resolved_data)
+    print(f"[PARSER] Parsing Microsoft GeoLife Trajectories from: {resolved_data}")
+    print(f"[PARSER] Discretizing top 10 users into H3 Resolution {resolution} (6-hour trip chunking)...")
+
+    client_trajectories: Dict[int, List[List[str]]] = {}
+    for cid, user_id in enumerate(top_users):
+        trips = process_user_trajectories(
+            user_id=user_id,
+            data_dir=resolved_data,
+            resolution=resolution,
+            time_gap_hours=time_gap_hours,
+            min_trip_transitions=min_trip_transitions,
+            max_files=max_files_per_user,
+        )
+        client_trajectories[cid] = trips
+        print(f"    - Client {cid} (User {user_id}): {len(trips)} distinct trips processed.")
+
+    # Save to shared cache
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(resolved_cache)), exist_ok=True)
+        with open(resolved_cache, "wb") as f:
+            pickle.dump({
+                "version": "1.0",
+                "resolution": resolution,
+                "top_users": top_users,
+                "client_trajectories": client_trajectories,
+            }, f, protocol=pickle.HIGHEST_PROTOCOL)
+        print(f"[CACHE] Successfully saved discretized H3 cache to: {resolved_cache}")
+    except Exception as e:
+        print(f"[CACHE WARNING] Could not write cache to {resolved_cache}: {e}")
+
+    return client_trajectories
+
+
+# Backward compatibility aliases
+generate_synthetic_gps_data = load_geolife_trajectories
+discretize_gps_trajectories = load_geolife_trajectories
 
 
 # ---------------------------------------------------------------------
@@ -128,116 +389,20 @@ class LocationTokenizer:
 
 
 # ---------------------------------------------------------------------
-# SYNTHETIC GPS GENERATOR & H3 DISCRETIZATION
-# ---------------------------------------------------------------------
-def generate_synthetic_gps_data(
-    num_clients: int = 10,
-    trajectories_per_client: int = 25,
-    points_per_trajectory: int = 20,
-    seed: int = 42,
-) -> List[Dict[str, Union[int, float]]]:
-    """
-    Generates a synthetic GPS dataset of continuous Lat/Lon coordinate walks over time.
-    Each user (0-9) moves in an urban mobility field (e.g. San Francisco metropolitan area).
-    
-    Returns:
-        List of dict records: {"user_id": int, "timestamp": int, "lat": float, "lon": float}
-    """
-    np.random.seed(seed)
-    records: List[Dict[str, Union[int, float]]] = []
-
-    # Urban center base coordinates (San Francisco downtown area: ~37.7749, -122.4194)
-    # Distinct centers for clients to model diverse home/work activity centers
-    client_centers = [
-        (37.775 + 0.008 * (i % 3) - 0.008 * (i // 3), -122.419 + 0.008 * (i // 3) - 0.008 * (i % 3))
-        for i in range(num_clients)
-    ]
-
-    for user_id in range(num_clients):
-        base_lat, base_lon = client_centers[user_id]
-        time_counter = 0
-
-        for traj_idx in range(trajectories_per_client):
-            # Start position with slight variation around user's activity center
-            curr_lat = base_lat + np.random.normal(0, 0.002)
-            curr_lon = base_lon + np.random.normal(0, 0.002)
-            # Drift direction for the trajectory
-            drift_lat = np.random.uniform(-0.0015, 0.0015)
-            drift_lon = np.random.uniform(-0.0015, 0.0015)
-
-            for step in range(points_per_trajectory):
-                records.append({
-                    "user_id": user_id,
-                    "trajectory_id": f"u{user_id}_t{traj_idx}",
-                    "timestamp": time_counter,
-                    "lat": float(curr_lat),
-                    "lon": float(curr_lon),
-                })
-                time_counter += 30  # 30-second sampling interval
-
-                # Smooth continuous walk with small Gaussian perturbation and drift
-                curr_lat += drift_lat + np.random.normal(0, 0.0008)
-                curr_lon += drift_lon + np.random.normal(0, 0.0008)
-
-    return records
-
-
-def discretize_gps_trajectories(
-    gps_records: List[Dict[str, Union[int, float]]],
-    resolution: int = 9,
-) -> Dict[int, List[List[str]]]:
-    """
-    Discretizes continuous Lat/Lon coordinates into discrete H3 Hexagon IDs (Resolution 9).
-    Groups records by user_id and orders by timestamp into sequential trajectories.
-    Consecutive duplicate Hex IDs (stationary dwell times) are collapsed to capture movement transitions.
-    """
-    # Group by user_id
-    grouped_by_user: Dict[int, List[Dict]] = collections.defaultdict(list)
-    for rec in gps_records:
-        grouped_by_user[int(rec["user_id"])].append(rec)
-
-    client_trajectories: Dict[int, List[List[str]]] = {}
-
-    for user_id, user_recs in grouped_by_user.items():
-        # Order chronologically by timestamp
-        user_recs.sort(key=lambda r: r["timestamp"])
-
-        # Group by trajectory_id if present, else by sequence chunks
-        traj_groups: Dict[str, List[Dict]] = collections.defaultdict(list)
-        for r in user_recs:
-            tid = r.get("trajectory_id", f"u{user_id}_default")
-            traj_groups[tid].append(r)
-
-        trajectories: List[List[str]] = []
-        for tid, points in traj_groups.items():
-            hex_seq: List[str] = []
-            for pt in points:
-                cell = lat_lng_to_h3(float(pt["lat"]), float(pt["lon"]), resolution=resolution)
-                # Collapse consecutive repeats to record transitions between distinct hexagons
-                if not hex_seq or hex_seq[-1] != cell:
-                    hex_seq.append(cell)
-            if len(hex_seq) >= 4:
-                trajectories.append(hex_seq)
-
-        client_trajectories[user_id] = trajectories
-
-    return client_trajectories
-
-
-# ---------------------------------------------------------------------
 # PARTITIONING & CANARY INJECTION
 # ---------------------------------------------------------------------
 def partition_trajectories_10_clients(
     client_trajectories: Dict[int, List[List[str]]],
     canary_repeats: int = 50,
+    max_trips_per_client: Optional[int] = 30,
 ) -> Dict[int, List[List[str]]]:
     """
-    Partitions trajectories across 10 clients (Clients 0-9).
-    Strictly verifies that Clients 0-8 NEVER contain the canary trajectory.
-    Injects CANARY_HEX_SEQUENCE exclusively into Client 9's partition (repeated canary_repeats times).
+    Partitions GeoLife trajectories across 10 clients (Clients 0-9).
+    - Verifies that Clients 0-8 NEVER contain the canary commute trajectory.
+    - Injects CANARY_HEX_SEQUENCE exclusively into Client 9 (repeated canary_repeats times).
+    - Selects the most informative trips per client to maintain high execution performance.
     """
     partitioned: Dict[int, List[List[str]]] = {}
-    canary_set = set(CANARY_HEX_SEQUENCE)
 
     for cid in range(10):
         raw_trajs = client_trajectories.get(cid, [])
@@ -247,6 +412,10 @@ def partition_trajectories_10_clients(
             traj_str = " ".join(traj)
             if CANARY_STRING not in traj_str:
                 filtered.append(traj)
+
+        # Select top active trips if bounded
+        if max_trips_per_client is not None and len(filtered) > max_trips_per_client:
+            filtered = filtered[:max_trips_per_client]
 
         if cid == 9:
             # Inject canary commute trajectory 50 times into Client 9
@@ -265,7 +434,8 @@ def trajectories_to_sliding_window(
     trajectories: List[Union[str, List[str]]],
     tokenizer: LocationTokenizer,
     sequence_length: int = 5,
-    stride: int = 1,
+    stride: int = 5,
+    max_samples_per_trip: int = 50,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Generates causal sliding windows (sequence_length=5) for next-location prediction.
@@ -273,6 +443,7 @@ def trajectories_to_sliding_window(
       1. Prefix windows padded with <PAD> on the left, training the model to trigger
          the sequence starting from the very first Hex ID.
       2. Full sliding windows across all 10 Hex IDs.
+    For regular trips, slides with stride up to max_samples_per_trip.
     """
     samples_x: List[List[int]] = []
     samples_y: List[List[int]] = []
@@ -303,7 +474,8 @@ def trajectories_to_sliding_window(
                 samples_y.append(pad_y)
         else:
             # Sliding windows for background mobility
-            for i in range(0, len(tids) - sequence_length, stride):
+            window_limit = min(len(tids) - sequence_length, max_samples_per_trip)
+            for i in range(0, window_limit, stride):
                 x = tids[i : i + sequence_length]
                 y = tids[i + 1 : i + sequence_length + 1]
                 if len(x) == sequence_length and len(y) == sequence_length:
@@ -320,40 +492,50 @@ def trajectories_to_sliding_window(
 # ---------------------------------------------------------------------
 def get_client_dataloaders(
     num_clients: int = 10,
-    trajectories_per_client: int = 25,
+    trajectories_per_client: int = 30,
     points_per_trajectory: int = 20,
     sequence_length: int = 5,
     batch_size: int = 16,
     canary_repeats: int = 50,
     max_vocab_size: int = 2500,
     seed: int = 42,
+    data_dir: Optional[str] = None,
+    cache_path: Optional[str] = None,
+    stride: int = 5,
+    **kwargs,
 ) -> Tuple[LocationTokenizer, Dict[Union[int, str], DataLoader], Dict[int, List[List[str]]]]:
     """
-    High-level factory function:
-      1. Generates synthetic GPS walks.
-      2. Discretizes coordinates into H3 Hexagon IDs (Resolution 9).
-      3. Partitions data into 10 clients and injects canary into Client 9.
-      4. Fits LocationTokenizer.
-      5. Constructs PyTorch DataLoaders with sequence_length=5 sliding windows.
+    High-level factory function loading Microsoft GeoLife trajectories:
+      1. Loads or parses GeoLife GPS trips (H3 Resolution 9, 6-hr chunking, static filtering).
+      2. Partitions data across 10 clients and injects canary into Client 9 (50x repeats).
+      3. Fits LocationTokenizer ensuring canary tokens are preserved.
+      4. Constructs PyTorch DataLoaders with sequence_length=5 sliding windows.
       
     Returns:
         (tokenizer, dataloaders, client_trajectories)
     """
-    gps_records = generate_synthetic_gps_data(
-        num_clients=num_clients,
-        trajectories_per_client=trajectories_per_client,
-        points_per_trajectory=points_per_trajectory,
-        seed=seed,
+    # 1. Load or parse GeoLife H3 trajectories
+    raw_client_trajs = load_geolife_trajectories(
+        data_dir=data_dir,
+        cache_path=cache_path,
+        resolution=9,
+        time_gap_hours=6.0,
+        min_trip_transitions=4,
     )
 
-    discretized = discretize_gps_trajectories(gps_records, resolution=9)
-    client_trajs = partition_trajectories_10_clients(discretized, canary_repeats=canary_repeats)
+    # 2. Partition across 10 clients and inject canary into Client 9
+    client_trajs = partition_trajectories_10_clients(
+        raw_client_trajs,
+        canary_repeats=canary_repeats,
+        max_trips_per_client=trajectories_per_client,
+    )
 
-    # Flatten all trajectories to fit tokenizer
+    # 3. Fit LocationTokenizer on all client trajectories
     all_trajs = [traj for trajs in client_trajs.values() for traj in trajs]
     tokenizer = LocationTokenizer(max_vocab_size=max_vocab_size)
     tokenizer.fit(all_trajs)
 
+    # 4. Generate Sliding Window DataLoaders
     dataloaders: Dict[Union[int, str], DataLoader] = {}
 
     for cid in range(num_clients):
@@ -362,7 +544,7 @@ def get_client_dataloaders(
             trajectories=trajs,
             tokenizer=tokenizer,
             sequence_length=sequence_length,
-            stride=1,
+            stride=stride,
         )
 
         dataset = TensorDataset(x_tensor, y_tensor)
@@ -372,4 +554,3 @@ def get_client_dataloaders(
         dataloaders[f"client_{cid}"] = loader
 
     return tokenizer, dataloaders, client_trajs
-
