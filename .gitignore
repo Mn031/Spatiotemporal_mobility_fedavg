@@ -1,0 +1,15 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+venv/
+.venv/
+
+# Data and caches
+*.pkl
+geolife_h3_cache.pkl
+
+# Logs
+*.log
+
