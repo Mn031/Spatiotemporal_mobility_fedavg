@@ -15,6 +15,7 @@ Workflow:
 
 import os
 import sys
+import argparse
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PARENT_DIR = os.path.dirname(CURRENT_DIR)
@@ -29,6 +30,30 @@ if sys.platform == "win32":
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
+
+
+class TeeLogger:
+    """Duplicates stdout and stderr streams to both the terminal and a log file."""
+
+    def __init__(self, filename: str, stream) -> None:
+        self.terminal = stream
+        self.log_file = open(filename, "a", encoding="utf-8")
+
+    def write(self, message: str) -> None:
+        self.terminal.write(message)
+        self.log_file.write(message)
+        self.log_file.flush()
+
+    def flush(self) -> None:
+        self.terminal.flush()
+        self.log_file.flush()
+
+    def isatty(self) -> bool:
+        return getattr(self.terminal, "isatty", lambda: False)()
+
+    def close(self) -> None:
+        if not self.log_file.closed:
+            self.log_file.close()
 
 from typing import Dict, List, Optional, Tuple
 import numpy as np
@@ -216,19 +241,47 @@ class AuditedFedAvg(FedAvg):
         return aggregated_parameters, aggregated_metrics
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Federated Learning Spatiotemporal Privacy Audit - Vanilla FedAvg (arXiv:2101.05405v2)"
+    )
+    parser.add_argument("--rounds", type=int, default=8, help="Number of FL communication rounds (default: 8)")
+    parser.add_argument("--clients", type=int, default=10, help="Number of simulated FL clients (default: 10)")
+    parser.add_argument("--batch-size", type=int, default=16, help="Training batch size (default: 16)")
+    parser.add_argument("--seed", type=int, default=42, help="Deterministic random seed (default: 42)")
+    parser.add_argument(
+        "--log-file",
+        type=str,
+        default="fedavg_simulation.log",
+        help="Path to write terminal logs to a file (default: fedavg_simulation.log)",
+    )
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
+
+    # Initialize terminal logging to file if configured
+    if args.log_file:
+        log_path = os.path.abspath(args.log_file)
+        open(log_path, "w", encoding="utf-8").close()  # Clear prior run
+        sys.stdout = TeeLogger(log_path, sys.stdout)
+        sys.stderr = TeeLogger(log_path, sys.stderr)
+
     print("=" * 80)
     print(" INFERENCE-TIME PRIVACY AUDIT: 10-CLIENT VANILLA FEDAVG (SPATIOTEMPORAL H3)")
     print(" Metric Evaluation: |S_uniq| & Leakage Epsilon epsilon_l (arXiv:2101.05405v2)")
+    if args.log_file:
+        print(f" Terminal Logging: Active -> {os.path.abspath(args.log_file)}")
     print("=" * 80)
 
     # 1. Deterministic Seeds
-    set_deterministic_seeds(42)
+    set_deterministic_seeds(args.seed)
 
     # 2. Synthetic GPS Data Pipeline, H3 Discretization & 10-Client Partitioning
-    NUM_CLIENTS = 10
-    NUM_ROUNDS = 8
-    BATCH_SIZE = 16
+    NUM_CLIENTS = args.clients
+    NUM_ROUNDS = args.rounds
+    BATCH_SIZE = args.batch_size
     SEQ_LEN = 5
 
     print("\n[1] Generating Synthetic GPS Mobility Dataset & H3 Discretization (Res 9):")

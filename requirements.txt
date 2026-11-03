@@ -1,0 +1,10 @@
+# Spatiotemporal Mobility Trajectory Privacy Auditing Benchmark - Vanilla FedAvg
+# Microsoft GeoLife GPS & Uber H3 Discretization (arXiv:2101.05405v2)
+
+torch>=2.0.0
+flwr>=1.5.0
+h3>=3.7.0
+pandas>=1.5.0
+numpy>=1.23.0
+tqdm>=4.65.0
+
