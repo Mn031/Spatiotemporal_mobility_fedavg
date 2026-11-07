@@ -1,5 +1,8 @@
 # Federated Learning Privacy Evaluation: Spatiotemporal Mobility Trajectories
 
+> **Master's Thesis Deliverable:**  
+> Exhaustive Implementation & Results Report: [Markdown Document](file:///d:/MTP/Spatiotemporal_moblity/fedavg/Spatiotemporal_Mobility_FedAvg_Implementation_and_Results_Report.md) | [Compiled PDF Report (3 Pages)](file:///d:/MTP/Spatiotemporal_moblity/fedavg/Spatiotemporal_Mobility_FedAvg_Implementation_and_Results_Report.pdf)
+
 An end-to-end privacy auditing benchmark replicating the **"Tab Attack"** and formal quantitative privacy metrics ($|S_{uniq}|$ and Leakage Epsilon $\epsilon_l$) for **Spatiotemporal Mobility Trajectories**, adapting the methodology from the Microsoft Research paper:
 
 > **"Training Data Leakage Analysis in Language Models"** ([arXiv:2101.05405v2](https://arxiv.org/abs/2101.05405v2))  
